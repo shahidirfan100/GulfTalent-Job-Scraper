@@ -1,0 +1,72 @@
+{
+  "title": "GulfTalent Jobs Scraper",
+  "description": "Scrape jobs from GulfTalent. You can provide either a search URL or keywords/location.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "A GulfTalent search URL to start scraping from. If provided, this will override the Keyword and Location fields.",
+      "editor": "textfield"
+    },
+    "keyword": {
+      "title": "Keyword",
+      "type": "string",
+      "description": "Search term(s) for jobs (used if Start URL is not provided).",
+      "editor": "textfield"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Optional location filter (used if Start URL is not provided).",
+      "editor": "textfield"
+    },
+    "posted_date": {
+      "title": "Posted Date",
+      "type": "string",
+      "description": "Filter jobs by posted date.",
+      "enum": [
+        "24h",
+        "7d",
+        "30d",
+        "anytime"
+      ],
+      "editor": "select"
+    },
+    "collectDetails": {
+      "title": "Collect job details",
+      "type": "boolean",
+      "description": "If enabled, the scraper also opens each job detail page to capture the full description (slower, but richer data).",
+      "default": true,
+      "editor": "checkbox"
+    },
+    "maxJobs": {
+      "title": "Max jobs",
+      "type": "integer",
+      "description": "Maximum number of jobs to collect. Leave empty to collect all available.",
+      "minimum": 1,
+      "editor": "number"
+    },
+    "maxPages": {
+      "title": "Max pages",
+      "type": "integer",
+      "description": "Safety cap on how many listing pages to visit. Leave empty for no cap (the actor still stops at Max jobs).",
+      "minimum": 1,
+      "editor": "number"
+    },
+    "cookies": {
+      "title": "Custom cookies (raw header)",
+      "type": "string",
+      "description": "Optional raw Cookie header string (e.g., \"pref_exp=; OptanonConsent=...\").",
+      "editor": "textfield"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Use Apify Proxy (recommended). Consider Residential if you encounter blocks.",
+      "editor": "proxy"
+    }
+  },
+  "required": []
+}
