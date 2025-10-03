@@ -240,27 +240,80 @@ const crawler = new CheerioCrawler({
         } else if (label === 'DETAIL') {
             log.info(`Scraping detail page: ${request.url}`);
             
-            // Try multiple selectors for job description
-            const descriptionElement = $('.job-description').first() || 
-                                      $('.description').first() || 
-                                      $('[itemprop="description"]').first() ||
-                                      $('.job-details').first();
-            
-            const description_html = descriptionElement.html()?.trim() || null;
-            const description_text = descriptionElement.text()?.trim() || null;
+            // Extract structured job details from the metadata section
+            const extractMetadata = (labelText) => {
+                const element = $(`span[style*="color: #6c757d"]:contains("${labelText}")`).parent();
+                return element.find('span').last().text().trim() || null;
+            };
 
-            // Extract additional details if available
-            const salary = $('.salary, [itemprop="baseSalary"]').text().trim() || null;
-            const jobType = $('.job-type, [itemprop="employmentType"]').text().trim() || null;
-            const category = $('.category, .job-category').text().trim() || null;
+            const jobType = extractMetadata('Job Type');
+            const jobLocation = extractMetadata('Job Location');
+            const nationality = extractMetadata('Nationality');
+            const salary = extractMetadata('Salary');
+            const gender = extractMetadata('Gender');
+            const arabicFluency = extractMetadata('Arabic Fluency');
+            const jobFunction = extractMetadata('Job Function');
+            const companyIndustry = extractMetadata('Company Industry');
+
+            // Find the job description content
+            // Remove the header ribbon sections and metadata
+            const descriptionContainer = $('.job-details, .job-description, [class*="job-content"]').first();
+            
+            // Clone to avoid modifying original DOM
+            const $desc = descriptionContainer.clone();
+            
+            // Remove unwanted sections
+            $desc.find('.header-ribbon').remove();
+            $desc.find('.row.space-bottom-sm').remove();
+            $desc.find('.space-bottom-sm').remove();
+            $desc.find('h4:contains("About the Company")').remove();
+            $desc.find('h4:contains("About the Company")').nextAll().remove();
+            $desc.find('.btn, .btn-primary, [class*="apply"]').remove();
+            $desc.find('[data-cy*="apply"]').remove();
+            
+            // Get the main description paragraphs only
+            let description_html = '';
+            let description_text = '';
+            
+            // Extract only the <p> tags that contain actual job description
+            $desc.find('p').each((i, elem) => {
+                const text = $(elem).text().trim();
+                // Skip empty paragraphs and company info
+                if (text && !text.includes('Linum Consult') && !text.includes('All Linum Consultants')) {
+                    description_html += $.html(elem);
+                    description_text += text + '\n\n';
+                }
+            });
+            
+            // If no paragraphs found, try to get all text content
+            if (!description_text.trim()) {
+                description_text = $desc.text().trim();
+                description_html = $desc.html()?.trim() || null;
+            }
+            
+            // Clean up the description text - remove excessive whitespace and newlines
+            description_text = description_text
+                .replace(/\s+/g, ' ')  // Replace multiple spaces with single space
+                .replace(/\n\s*\n/g, '\n\n')  // Replace multiple newlines with double newline
+                .trim();
+            
+            // Clean up HTML - remove extra whitespace
+            description_html = description_html
+                .replace(/>\s+</g, '><')  // Remove whitespace between tags
+                .trim();
 
             await Dataset.pushData({
                 ...request.userData.jobData,
-                description_html,
-                description_text,
-                salary,
-                jobType,
-                category,
+                description_html: description_html || null,
+                description_text: description_text || null,
+                jobType: jobType !== 'Not Specified' ? jobType : null,
+                jobLocation: jobLocation !== 'Not Specified' ? jobLocation : null,
+                nationality: nationality !== 'Not Specified' ? nationality : null,
+                salary: salary !== 'Not Specified' ? salary : null,
+                gender: gender !== 'Not Specified' ? gender : null,
+                arabicFluency: arabicFluency !== 'Not Specified' ? arabicFluency : null,
+                jobFunction: jobFunction !== 'Not Specified' ? jobFunction : null,
+                companyIndustry: companyIndustry !== 'Not Specified' ? companyIndustry : null,
             });
         }
     },
