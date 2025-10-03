@@ -1,6 +1,5 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset, KeyValueStore } from 'crawlee';
-import { Cookie, CookieJar } from 'tough-cookie';
 
 const BASE_URL = 'https://www.gulftalent.com';
 
@@ -31,36 +30,131 @@ const state = await KeyValueStore.getAutoSavedValue('CRAWLER_STATE', {
     jobsScraped: 0,
 });
 
-// --- COOKIE JAR SETUP ---
-const cookieJar = new CookieJar();
-if (cookies) {
-    const cookieStrings = cookies.split(';').map(c => c.trim());
-    for (const cookieString of cookieStrings) {
-        try {
-            await cookieJar.setCookie(Cookie.parse(cookieString), BASE_URL);
-        } catch (e) {
-            log.warning(`Failed to parse cookie: ${cookieString}`, { error: e.message });
-        }
-    }
-}
+// Parse cookies into headers format
+const cookieHeader = cookies ? cookies.trim() : '';
 
 const crawler = new CheerioCrawler({
     proxyConfiguration: proxyConfig,
-    cookieJar,
+    maxRequestRetries: 3,
+    maxConcurrency: 5,
+    requestHandlerTimeoutSecs: 120,
+    
+    // Pre-navigation hooks to add cookies
+    preNavigationHooks: [
+        async ({ request, session }) => {
+            // Add cookies to request headers
+            if (cookieHeader) {
+                request.headers = {
+                    ...request.headers,
+                    'Cookie': cookieHeader,
+                };
+            }
+            
+            // Add common headers to avoid blocking
+            request.headers = {
+                ...request.headers,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Cache-Control': 'max-age=0',
+            };
+        },
+    ],
+
     requestHandler: async ({ $, request, log, crawler }) => {
         const { userData: { label } } = request;
 
         if (label === 'LIST') {
             log.info(`Scraping list page: ${request.url} (Page ${state.pagesScraped + 1})`);
+            
+            // Check if we've been blocked
+            if ($('title').text().toLowerCase().includes('access denied') || 
+                $('title').text().toLowerCase().includes('captcha') ||
+                $('body').text().toLowerCase().includes('blocked')) {
+                log.warning(`Possible blocking detected on ${request.url}`);
+                throw new Error('Blocked - will retry with different proxy');
+            }
+
             state.pagesScraped++;
 
+            // Try to find the script with job data
             const scriptContent = $('script:contains("facetedSearchResultsValue")').html();
+            
             if (!scriptContent) {
-                log.warning(`Could not find the script tag with job data on ${request.url}. This might be a block page or the page structure may have changed.`);
+                log.warning(`Could not find the script tag with job data on ${request.url}.`);
+                
+                // Fallback: Try to scrape jobs directly from HTML
+                const jobCards = $('.search-result-item, .job-item, [data-job-id]');
+                log.info(`Found ${jobCards.length} job cards using fallback selector`);
+                
+                if (jobCards.length === 0) {
+                    log.warning('No jobs found. Page might be blocked or structure changed.');
+                    log.info('Page title:', $('title').text());
+                    return;
+                }
+
+                // Process each job card
+                jobCards.each((i, elem) => {
+                    if (maxJobs && state.jobsScraped >= maxJobs) return false;
+
+                    const $card = $(elem);
+                    const titleElem = $card.find('h2 a, .job-title a, a[data-job-title]').first();
+                    const companyElem = $card.find('.company-name, [data-company-name]').first();
+                    const locationElem = $card.find('.location, [data-location]').first();
+                    const dateElem = $card.find('.date, .posted-date, time').first();
+                    
+                    const title = titleElem.text().trim();
+                    const jobUrl = titleElem.attr('href');
+                    
+                    if (!title || !jobUrl) return;
+
+                    const fullUrl = jobUrl.startsWith('http') ? jobUrl : new URL(jobUrl, BASE_URL).href;
+                    
+                    const jobData = {
+                        title,
+                        company: companyElem.text().trim() || 'Not specified',
+                        location: locationElem.text().trim() || 'Not specified',
+                        date_posted: dateElem.text().trim() || dateElem.attr('datetime') || 'Not specified',
+                        url: fullUrl,
+                    };
+
+                    if (collectDetails) {
+                        crawler.addRequests([{ 
+                            url: fullUrl,
+                            userData: {
+                                label: 'DETAIL',
+                                jobData,
+                            },
+                        }]);
+                    } else {
+                        Dataset.pushData({
+                            ...jobData,
+                            description_html: null,
+                            description_text: null,
+                        });
+                    }
+                    state.jobsScraped++;
+                });
+
+                // Try to find pagination
+                const nextLink = $('a.next, .pagination .next, [rel="next"]').attr('href');
+                if (nextLink && (!maxJobs || state.jobsScraped < maxJobs) && (!maxPages || state.pagesScraped < maxPages)) {
+                    const nextUrl = nextLink.startsWith('http') ? nextLink : new URL(nextLink, BASE_URL).href;
+                    log.info(`Enqueuing next page: ${nextUrl}`);
+                    await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
+                }
+
                 return;
             }
 
-            const jsonStringMatch = scriptContent.match(/facetedSearchResultsValue\', (.*)\)/);
+            // Original JSON parsing logic
+            const jsonStringMatch = scriptContent.match(/facetedSearchResultsValue['"]\s*,\s*({[\s\S]*?})\s*\)/);
             if (!jsonStringMatch || !jsonStringMatch[1]) {
                 log.warning(`Could not extract JSON from script tag on ${request.url}`);
                 return;
@@ -68,8 +162,10 @@ const crawler = new CheerioCrawler({
 
             try {
                 const searchResults = JSON.parse(jsonStringMatch[1]);
-                const jobs = searchResults.results.data;
-                const totalResults = searchResults.results.total;
+                const jobs = searchResults.results?.data || [];
+                const totalResults = searchResults.results?.total || 0;
+
+                log.info(`Found ${jobs.length} jobs on this page. Total: ${totalResults}`);
 
                 if (jobs.length === 0) {
                     log.info('No more jobs found on this page. Stopping pagination.');
@@ -78,15 +174,21 @@ const crawler = new CheerioCrawler({
 
                 for (const job of jobs) {
                     if (maxJobs && state.jobsScraped >= maxJobs) {
-                        break; // Stop processing jobs on this page if maxJobs is reached
+                        log.info(`Reached maxJobs limit: ${maxJobs}`);
+                        break;
                     }
 
-                    const jobUrl = new URL(job.link, BASE_URL).href;
+                    const jobUrl = job.link?.startsWith('http') 
+                        ? job.link 
+                        : new URL(job.link || '', BASE_URL).href;
+                    
                     const jobData = {
-                        title: job.title,
-                        company: job.company_name,
-                        location: job.location,
-                        date_posted: new Date(job.posted_date_ts * 1000).toISOString(),
+                        title: job.title || 'Not specified',
+                        company: job.company_name || 'Not specified',
+                        location: job.location || 'Not specified',
+                        date_posted: job.posted_date_ts 
+                            ? new Date(job.posted_date_ts * 1000).toISOString() 
+                            : 'Not specified',
                         url: jobUrl,
                     };
 
@@ -109,36 +211,64 @@ const crawler = new CheerioCrawler({
                 }
 
                 // --- PAGINATION ---
-                const continueCrawling = (!maxJobs || state.jobsScraped < maxJobs) && (!maxPages || state.pagesScraped < maxPages);
+                const continueCrawling = (!maxJobs || state.jobsScraped < maxJobs) && 
+                                       (!maxPages || state.pagesScraped < maxPages);
+                
                 if (continueCrawling && state.jobsScraped < totalResults) {
-                    const currentPageMatch = request.url.match(/page=(\d+)/);
+                    const currentPageMatch = request.url.match(/page[=\/](\d+)/);
                     const currentPage = currentPageMatch ? parseInt(currentPageMatch[1], 10) : 1;
-                    const nextUrl = request.url.includes('page=')
-                        ? request.url.replace(/page=\d+/, `page=${currentPage + 1}`)
-                        : `${request.url}${request.url.includes('?') ? '&' : '?'}page=${currentPage + 1}`;
+                    
+                    let nextUrl;
+                    if (request.url.includes('page=')) {
+                        nextUrl = request.url.replace(/page=\d+/, `page=${currentPage + 1}`);
+                    } else if (request.url.includes('/page/')) {
+                        nextUrl = request.url.replace(/\/page\/\d+/, `/page/${currentPage + 1}`);
+                    } else {
+                        nextUrl = `${request.url}${request.url.includes('?') ? '&' : '?'}page=${currentPage + 1}`;
+                    }
 
-                    log.info(`Enqueuing next page: ${nextUrl}`);
+                    log.info(`Enqueuing next page: ${nextUrl} (Jobs scraped: ${state.jobsScraped}/${totalResults})`);
                     await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
+                } else {
+                    log.info('Pagination stopped. Conditions met or no more pages.');
                 }
 
             } catch (e) {
-                log.error(`Failed to parse job data from script tag on ${request.url}`, { error: e.message });
+                log.error(`Failed to parse job data from script tag on ${request.url}`, { error: e.message, stack: e.stack });
             }
+
         } else if (label === 'DETAIL') {
             log.info(`Scraping detail page: ${request.url}`);
-            const descriptionElement = $('.job-description');
+            
+            // Try multiple selectors for job description
+            const descriptionElement = $('.job-description').first() || 
+                                      $('.description').first() || 
+                                      $('[itemprop="description"]').first() ||
+                                      $('.job-details').first();
+            
             const description_html = descriptionElement.html()?.trim() || null;
             const description_text = descriptionElement.text()?.trim() || null;
+
+            // Extract additional details if available
+            const salary = $('.salary, [itemprop="baseSalary"]').text().trim() || null;
+            const jobType = $('.job-type, [itemprop="employmentType"]').text().trim() || null;
+            const category = $('.category, .job-category').text().trim() || null;
 
             await Dataset.pushData({
                 ...request.userData.jobData,
                 description_html,
                 description_text,
+                salary,
+                jobType,
+                category,
             });
         }
     },
+
     failedRequestHandler: async ({ request, log }) => {
-        log.warning(`Request ${request.url} failed and will be retried.`);
+        log.warning(`Request ${request.url} failed after retries.`, {
+            errorMessages: request.errorMessages,
+        });
     },
 });
 
@@ -148,11 +278,12 @@ if (inputStartUrl) {
     startUrls.push({ url: inputStartUrl, userData: { label: 'LIST' } });
 } else {
     const constructedUrl = new URL('/jobs/search', BASE_URL);
+    
     if (keyword) {
-        constructedUrl.searchParams.set('keyword', keyword);
+        constructedUrl.searchParams.set('search_keyword', keyword);
     }
     if (location) {
-        constructedUrl.searchParams.set('location', location);
+        constructedUrl.searchParams.set('city', location);
     }
     if (posted_date && posted_date !== 'anytime') {
         const dateFilterMap = {
@@ -164,12 +295,16 @@ if (inputStartUrl) {
             constructedUrl.searchParams.set('filters[posted_date]', dateFilterMap[posted_date]);
         }
     }
-    constructedUrl.searchParams.set('page', 1);
+    constructedUrl.searchParams.set('page', '1');
+    
     startUrls.push({ url: constructedUrl.href, userData: { label: 'LIST' } });
 }
 
-log.info('Starting crawl...');
+log.info('Starting crawl...', { startUrls: startUrls.map(u => u.url) });
 await crawler.run(startUrls);
-log.info('Crawl finished.');
+log.info('Crawl finished.', { 
+    totalPages: state.pagesScraped, 
+    totalJobs: state.jobsScraped 
+});
 
 await Actor.exit();
