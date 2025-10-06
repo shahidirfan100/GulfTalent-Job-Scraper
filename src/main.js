@@ -3,6 +3,13 @@ import { CheerioCrawler, Dataset, KeyValueStore } from 'crawlee';
 
 const BASE_URL = 'https://www.gulftalent.com';
 
+// Configuration
+const CRAWLER_CONFIG = {
+    maxConcurrency: 5,
+    maxRequestRetries: 3,
+    requestHandlerTimeoutSecs: 120,
+};
+
 await Actor.init();
 
 const input = await Actor.getInput();
@@ -18,8 +25,17 @@ const {
     proxyConfiguration,
 } = input;
 
+// --- INPUT VALIDATION ---
 if (!inputStartUrl && !keyword) {
     throw new Error('Either \'startUrl\' or \'keyword\' must be provided as input.');
+}
+
+if (maxJobs && maxJobs < 1) {
+    throw new Error('maxJobs must be >= 1');
+}
+
+if (maxPages && maxPages < 1) {
+    throw new Error('maxPages must be >= 1');
 }
 
 const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
@@ -30,18 +46,171 @@ const state = await KeyValueStore.getAutoSavedValue('CRAWLER_STATE', {
     jobsScraped: 0,
 });
 
+// --- HELPER FUNCTIONS ---
+
+/**
+ * Validates and normalizes a URL
+ */
+function validateAndNormalizeUrl(url, baseUrl) {
+    if (!url || typeof url !== 'string') return null;
+    
+    try {
+        return url.startsWith('http') ? url : new URL(url, baseUrl).href;
+    } catch (e) {
+        log.warning(`Invalid URL: ${url}`, { error: e.message });
+        return null;
+    }
+}
+
+/**
+ * Checks if the page shows blocking/captcha
+ */
+function isBlocked($) {
+    const title = $('title').text().toLowerCase();
+    const bodyStart = $('body').text().substring(0, 500).toLowerCase();
+    
+    const blockingIndicators = [
+        'access denied',
+        'captcha',
+        'cloudflare',
+        'security check',
+        'blocked',
+        'robot',
+    ];
+    
+    return blockingIndicators.some(indicator => 
+        title.includes(indicator) || bodyStart.includes(indicator)
+    );
+}
+
+/**
+ * Extracts metadata from job detail page
+ */
+function extractMetadata($, labelText) {
+    // Try multiple selector strategies
+    const selectors = [
+        `span[style*="color: #6c757d"]:contains("${labelText}")`,
+        `.job-metadata span:contains("${labelText}")`,
+        `label:contains("${labelText}")`,
+    ];
+    
+    for (const selector of selectors) {
+        try {
+            const element = $(selector).parent();
+            const value = element.find('span').last().text().trim();
+            if (value && value !== 'Not Specified') {
+                return value;
+            }
+        } catch (e) {
+            // Continue to next selector
+        }
+    }
+    
+    log.debug(`Metadata not found: ${labelText}`);
+    return null;
+}
+
+/**
+ * Cleans and extracts job description
+ */
+function cleanDescription($) {
+    const descriptionContainer = $('.job-details, .job-description, [class*="job-content"]').first();
+    
+    if (!descriptionContainer.length) {
+        log.warning('Description container not found');
+        return { html: null, text: null };
+    }
+    
+    // Clone to avoid modifying original DOM
+    const $desc = descriptionContainer.clone();
+    
+    // Remove unwanted sections
+    const unwantedSelectors = [
+        '.header-ribbon',
+        '.row.space-bottom-sm',
+        '.space-bottom-sm',
+        'h4:contains("About the Company")',
+        '.btn',
+        '.btn-primary',
+        '[class*="apply"]',
+        '[data-cy*="apply"]',
+    ];
+    
+    unwantedSelectors.forEach(selector => {
+        $desc.find(selector).remove();
+    });
+    
+    // Remove company info sections
+    $desc.find('h4:contains("About the Company")').nextAll().remove();
+    
+    let description_html = '';
+    let description_text = '';
+    
+    // Extract only paragraphs with actual job description
+    const companyKeywords = ['Linum Consult', 'All Linum Consultants', 'recruitment agency'];
+    
+    $desc.find('p').each((i, elem) => {
+        const text = $(elem).text().trim();
+        
+        // Skip empty paragraphs and company info
+        if (text && !companyKeywords.some(keyword => text.includes(keyword))) {
+            description_html += $.html(elem);
+            description_text += text + '\n\n';
+        }
+    });
+    
+    // Fallback: get all text if no paragraphs found
+    if (!description_text.trim()) {
+        description_text = $desc.text().trim();
+        description_html = $desc.html()?.trim() || null;
+    }
+    
+    // Clean up excessive whitespace
+    description_text = description_text
+        .replace(/\s+/g, ' ')
+        .replace(/\n\s*\n/g, '\n\n')
+        .trim();
+    
+    description_html = description_html
+        .replace(/>\s+</g, '><')
+        .trim();
+    
+    return {
+        html: description_html || null,
+        text: description_text || null,
+    };
+}
+
+/**
+ * Constructs the next page URL
+ */
+function getNextPageUrl(currentUrl, currentPage) {
+    if (currentUrl.includes('page=')) {
+        return currentUrl.replace(/page=\d+/, `page=${currentPage + 1}`);
+    } else if (currentUrl.includes('/page/')) {
+        return currentUrl.replace(/\/page\/\d+/, `/page/${currentPage + 1}`);
+    } else {
+        const separator = currentUrl.includes('?') ? '&' : '?';
+        return `${currentUrl}${separator}page=${currentPage + 1}`;
+    }
+}
+
 // Parse cookies into headers format
 const cookieHeader = cookies ? cookies.trim() : '';
 
+if (cookieHeader) {
+    log.info('Using custom cookies for requests');
+}
+
 const crawler = new CheerioCrawler({
     proxyConfiguration: proxyConfig,
-    maxRequestRetries: 3,
-    maxConcurrency: 5,
-    requestHandlerTimeoutSecs: 120,
+    maxRequestRetries: CRAWLER_CONFIG.maxRequestRetries,
+    maxConcurrency: CRAWLER_CONFIG.maxConcurrency,
+    requestHandlerTimeoutSecs: CRAWLER_CONFIG.requestHandlerTimeoutSecs,
     
     // Pre-navigation hooks to add cookies
     preNavigationHooks: [
-        async ({ request, session }) => {
+        async ({ request }) => {
             // Add cookies to request headers
             if (cookieHeader) {
                 request.headers = {
@@ -67,17 +236,18 @@ const crawler = new CheerioCrawler({
         },
     ],
 
-    requestHandler: async ({ $, request, log, crawler }) => {
+    requestHandler: async ({ $, request, crawler }) => {
         const { userData: { label } } = request;
 
         if (label === 'LIST') {
-            log.info(`Scraping list page: ${request.url} (Page ${state.pagesScraped + 1})`);
+            log.info(`Scraping list page: ${request.url}`, {
+                page: state.pagesScraped + 1,
+                jobsScraped: state.jobsScraped,
+            });
             
             // Check if we've been blocked
-            if ($('title').text().toLowerCase().includes('access denied') || 
-                $('title').text().toLowerCase().includes('captcha') ||
-                $('body').text().toLowerCase().includes('blocked')) {
-                log.warning(`Possible blocking detected on ${request.url}`);
+            if (isBlocked($)) {
+                log.warning(`Blocking detected on ${request.url}`);
                 throw new Error('Blocked - will retry with different proxy');
             }
 
@@ -87,73 +257,97 @@ const crawler = new CheerioCrawler({
             const scriptContent = $('script:contains("facetedSearchResultsValue")').html();
             
             if (!scriptContent) {
-                log.warning(`Could not find the script tag with job data on ${request.url}.`);
+                log.warning(`Could not find script tag with job data on ${request.url}. Trying HTML fallback...`);
                 
-                // Fallback: Try to scrape jobs directly from HTML
-                const jobCards = $('.search-result-item, .job-item, [data-job-id]');
-                log.info(`Found ${jobCards.length} job cards using fallback selector`);
-                
-                if (jobCards.length === 0) {
-                    log.warning('No jobs found. Page might be blocked or structure changed.');
-                    log.info('Page title:', $('title').text());
-                    return;
-                }
-
-                // Process each job card
-                jobCards.each((i, elem) => {
-                    if (maxJobs && state.jobsScraped >= maxJobs) return false;
-
-                    const $card = $(elem);
-                    const titleElem = $card.find('h2 a, .job-title a, a[data-job-title]').first();
-                    const companyElem = $card.find('.company-name, [data-company-name]').first();
-                    const locationElem = $card.find('.location, [data-location]').first();
-                    const dateElem = $card.find('.date, .posted-date, time').first();
+                // --- FALLBACK: HTML SCRAPING ---
+                try {
+                    const jobCards = $('.search-result-item, .job-item, [data-job-id]');
+                    log.info(`Found ${jobCards.length} job cards using fallback selector`);
                     
-                    const title = titleElem.text().trim();
-                    const jobUrl = titleElem.attr('href');
-                    
-                    if (!title || !jobUrl) return;
-
-                    const fullUrl = jobUrl.startsWith('http') ? jobUrl : new URL(jobUrl, BASE_URL).href;
-                    
-                    const jobData = {
-                        title,
-                        company: companyElem.text().trim() || 'Not specified',
-                        location: locationElem.text().trim() || 'Not specified',
-                        date_posted: dateElem.text().trim() || dateElem.attr('datetime') || 'Not specified',
-                        url: fullUrl,
-                    };
-
-                    if (collectDetails) {
-                        crawler.addRequests([{ 
-                            url: fullUrl,
-                            userData: {
-                                label: 'DETAIL',
-                                jobData,
-                            },
-                        }]);
-                    } else {
-                        Dataset.pushData({
-                            ...jobData,
-                            description_html: null,
-                            description_text: null,
-                        });
+                    if (jobCards.length === 0) {
+                        log.warning('No jobs found. Page might be blocked or structure changed.');
+                        log.info('Page title:', $('title').text());
+                        return;
                     }
-                    state.jobsScraped++;
-                });
 
-                // Try to find pagination
-                const nextLink = $('a.next, .pagination .next, [rel="next"]').attr('href');
-                if (nextLink && (!maxJobs || state.jobsScraped < maxJobs) && (!maxPages || state.pagesScraped < maxPages)) {
-                    const nextUrl = nextLink.startsWith('http') ? nextLink : new URL(nextLink, BASE_URL).href;
-                    log.info(`Enqueuing next page: ${nextUrl}`);
-                    await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
+                    // Process each job card
+                    for (let i = 0; i < jobCards.length; i++) {
+                        if (maxJobs && state.jobsScraped >= maxJobs) {
+                            log.info(`Reached maxJobs limit: ${maxJobs}`);
+                            break;
+                        }
+
+                        const $card = $(jobCards[i]);
+                        const titleElem = $card.find('h2 a, .job-title a, a[data-job-title]').first();
+                        const companyElem = $card.find('.company-name, [data-company-name]').first();
+                        const locationElem = $card.find('.location, [data-location]').first();
+                        const dateElem = $card.find('.date, .posted-date, time').first();
+                        
+                        const title = titleElem.text().trim();
+                        const jobUrl = titleElem.attr('href');
+                        
+                        if (!title || !jobUrl) {
+                            log.debug('Skipping job card with missing title or URL');
+                            continue;
+                        }
+
+                        const fullUrl = validateAndNormalizeUrl(jobUrl, BASE_URL);
+                        if (!fullUrl) continue;
+                        
+                        const jobData = {
+                            title,
+                            company: companyElem.text().trim() || 'Not specified',
+                            location: locationElem.text().trim() || 'Not specified',
+                            date_posted: dateElem.text().trim() || dateElem.attr('datetime') || 'Not specified',
+                            url: fullUrl,
+                        };
+
+                        if (collectDetails) {
+                            await crawler.addRequests([{ 
+                                url: fullUrl,
+                                userData: {
+                                    label: 'DETAIL',
+                                    jobData,
+                                },
+                            }]);
+                        } else {
+                            await Dataset.pushData({
+                                ...jobData,
+                                description_html: null,
+                                description_text: null,
+                            });
+                        }
+                        state.jobsScraped++;
+                    }
+
+                    // Handle pagination
+                    const continueCrawling = (!maxJobs || state.jobsScraped < maxJobs) && 
+                                           (!maxPages || state.pagesScraped < maxPages);
+                    
+                    if (continueCrawling) {
+                        const nextLink = $('a.next, .pagination .next, [rel="next"]').attr('href');
+                        if (nextLink) {
+                            const nextUrl = validateAndNormalizeUrl(nextLink, BASE_URL);
+                            if (nextUrl) {
+                                log.info(`Enqueuing next page: ${nextUrl}`);
+                                await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
+                            }
+                        } else {
+                            log.info('No next page link found. End of results.');
+                        }
+                    }
+
+                } catch (e) {
+                    log.error(`Failed during HTML fallback scraping on ${request.url}`, { 
+                        error: e.message, 
+                        stack: e.stack 
+                    });
                 }
 
                 return;
             }
 
-            // Original JSON parsing logic
+            // --- PRIMARY: JSON PARSING ---
             const jsonStringMatch = scriptContent.match(/facetedSearchResultsValue['"]\s*,\s*({[\s\S]*?})\s*\)/);
             if (!jsonStringMatch || !jsonStringMatch[1]) {
                 log.warning(`Could not extract JSON from script tag on ${request.url}`);
@@ -165,7 +359,10 @@ const crawler = new CheerioCrawler({
                 const jobs = searchResults.results?.data || [];
                 const totalResults = searchResults.results?.total || 0;
 
-                log.info(`Found ${jobs.length} jobs on this page. Total: ${totalResults}`);
+                log.info(`Found ${jobs.length} jobs on this page`, {
+                    totalAvailable: totalResults,
+                    scraped: state.jobsScraped,
+                });
 
                 if (jobs.length === 0) {
                     log.info('No more jobs found on this page. Stopping pagination.');
@@ -178,9 +375,11 @@ const crawler = new CheerioCrawler({
                         break;
                     }
 
-                    const jobUrl = job.link?.startsWith('http') 
-                        ? job.link 
-                        : new URL(job.link || '', BASE_URL).href;
+                    const jobUrl = validateAndNormalizeUrl(job.link, BASE_URL);
+                    if (!jobUrl) {
+                        log.warning('Skipping job with invalid URL', { job });
+                        continue;
+                    }
                     
                     const jobData = {
                         title: job.title || 'Not specified',
@@ -218,109 +417,82 @@ const crawler = new CheerioCrawler({
                     const currentPageMatch = request.url.match(/page[=\/](\d+)/);
                     const currentPage = currentPageMatch ? parseInt(currentPageMatch[1], 10) : 1;
                     
-                    let nextUrl;
-                    if (request.url.includes('page=')) {
-                        nextUrl = request.url.replace(/page=\d+/, `page=${currentPage + 1}`);
-                    } else if (request.url.includes('/page/')) {
-                        nextUrl = request.url.replace(/\/page\/\d+/, `/page/${currentPage + 1}`);
-                    } else {
-                        nextUrl = `${request.url}${request.url.includes('?') ? '&' : '?'}page=${currentPage + 1}`;
-                    }
+                    const nextUrl = getNextPageUrl(request.url, currentPage);
 
-                    log.info(`Enqueuing next page: ${nextUrl} (Jobs scraped: ${state.jobsScraped}/${totalResults})`);
+                    log.info(`Enqueuing next page: ${nextUrl}`, {
+                        progress: `${state.jobsScraped}/${totalResults}`,
+                    });
                     await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
                 } else {
-                    log.info('Pagination stopped. Conditions met or no more pages.');
+                    log.info('Pagination stopped.', {
+                        reason: !continueCrawling ? 'Limits reached' : 'All jobs scraped',
+                        totalScraped: state.jobsScraped,
+                    });
                 }
 
             } catch (e) {
-                log.error(`Failed to parse job data from script tag on ${request.url}`, { error: e.message, stack: e.stack });
+                log.error(`Failed to parse job data from script tag on ${request.url}`, { 
+                    error: e.message, 
+                    stack: e.stack 
+                });
             }
 
         } else if (label === 'DETAIL') {
             log.info(`Scraping detail page: ${request.url}`);
             
-            // Extract structured job details from the metadata section
-            const extractMetadata = (labelText) => {
-                const element = $(`span[style*="color: #6c757d"]:contains("${labelText}")`).parent();
-                return element.find('span').last().text().trim() || null;
-            };
+            try {
+                // Extract structured job details
+                const jobType = extractMetadata($, 'Job Type');
+                const jobLocation = extractMetadata($, 'Job Location');
+                const nationality = extractMetadata($, 'Nationality');
+                const salary = extractMetadata($, 'Salary');
+                const gender = extractMetadata($, 'Gender');
+                const arabicFluency = extractMetadata($, 'Arabic Fluency');
+                const jobFunction = extractMetadata($, 'Job Function');
+                const companyIndustry = extractMetadata($, 'Company Industry');
 
-            const jobType = extractMetadata('Job Type');
-            const jobLocation = extractMetadata('Job Location');
-            const nationality = extractMetadata('Nationality');
-            const salary = extractMetadata('Salary');
-            const gender = extractMetadata('Gender');
-            const arabicFluency = extractMetadata('Arabic Fluency');
-            const jobFunction = extractMetadata('Job Function');
-            const companyIndustry = extractMetadata('Company Industry');
-
-            // Find the job description content
-            // Remove the header ribbon sections and metadata
-            const descriptionContainer = $('.job-details, .job-description, [class*="job-content"]').first();
-            
-            // Clone to avoid modifying original DOM
-            const $desc = descriptionContainer.clone();
-            
-            // Remove unwanted sections
-            $desc.find('.header-ribbon').remove();
-            $desc.find('.row.space-bottom-sm').remove();
-            $desc.find('.space-bottom-sm').remove();
-            $desc.find('h4:contains("About the Company")').remove();
-            $desc.find('h4:contains("About the Company")').nextAll().remove();
-            $desc.find('.btn, .btn-primary, [class*="apply"]').remove();
-            $desc.find('[data-cy*="apply"]').remove();
-            
-            // Get the main description paragraphs only
-            let description_html = '';
-            let description_text = '';
-            
-            // Extract only the <p> tags that contain actual job description
-            $desc.find('p').each((i, elem) => {
-                const text = $(elem).text().trim();
-                // Skip empty paragraphs and company info
-                if (text && !text.includes('Linum Consult') && !text.includes('All Linum Consultants')) {
-                    description_html += $.html(elem);
-                    description_text += text + '\n\n';
+                // Extract and clean description
+                const description = cleanDescription($);
+                
+                if (!description.text) {
+                    log.warning(`No description found for job: ${request.userData.jobData.title}`);
                 }
-            });
-            
-            // If no paragraphs found, try to get all text content
-            if (!description_text.trim()) {
-                description_text = $desc.text().trim();
-                description_html = $desc.html()?.trim() || null;
-            }
-            
-            // Clean up the description text - remove excessive whitespace and newlines
-            description_text = description_text
-                .replace(/\s+/g, ' ')  // Replace multiple spaces with single space
-                .replace(/\n\s*\n/g, '\n\n')  // Replace multiple newlines with double newline
-                .trim();
-            
-            // Clean up HTML - remove extra whitespace
-            description_html = description_html
-                .replace(/>\s+</g, '><')  // Remove whitespace between tags
-                .trim();
 
-            await Dataset.pushData({
-                ...request.userData.jobData,
-                description_html: description_html || null,
-                description_text: description_text || null,
-                jobType: jobType !== 'Not Specified' ? jobType : null,
-                jobLocation: jobLocation !== 'Not Specified' ? jobLocation : null,
-                nationality: nationality !== 'Not Specified' ? nationality : null,
-                salary: salary !== 'Not Specified' ? salary : null,
-                gender: gender !== 'Not Specified' ? gender : null,
-                arabicFluency: arabicFluency !== 'Not Specified' ? arabicFluency : null,
-                jobFunction: jobFunction !== 'Not Specified' ? jobFunction : null,
-                companyIndustry: companyIndustry !== 'Not Specified' ? companyIndustry : null,
-            });
+                await Dataset.pushData({
+                    ...request.userData.jobData,
+                    description_html: description.html,
+                    description_text: description.text,
+                    jobType,
+                    jobLocation,
+                    nationality,
+                    salary,
+                    gender,
+                    arabicFluency,
+                    jobFunction,
+                    companyIndustry,
+                });
+                
+            } catch (e) {
+                log.error(`Failed to extract details from ${request.url}`, {
+                    error: e.message,
+                    stack: e.stack,
+                });
+                
+                // Save basic data even if detail extraction fails
+                await Dataset.pushData({
+                    ...request.userData.jobData,
+                    description_html: null,
+                    description_text: null,
+                    error: 'Failed to extract job details',
+                });
+            }
         }
     },
 
-    failedRequestHandler: async ({ request, log }) => {
-        log.warning(`Request ${request.url} failed after retries.`, {
+    failedRequestHandler: async ({ request }) => {
+        log.warning(`Request ${request.url} failed after ${CRAWLER_CONFIG.maxRequestRetries} retries`, {
             errorMessages: request.errorMessages,
+            userData: request.userData,
         });
     },
 });
@@ -353,9 +525,20 @@ if (inputStartUrl) {
     startUrls.push({ url: constructedUrl.href, userData: { label: 'LIST' } });
 }
 
-log.info('Starting crawl...', { startUrls: startUrls.map(u => u.url) });
+log.info('Starting crawl...', { 
+    startUrls: startUrls.map(u => u.url),
+    config: {
+        collectDetails,
+        maxJobs: maxJobs || 'unlimited',
+        maxPages: maxPages || 'unlimited',
+        usingProxy: !!proxyConfig,
+        usingCookies: !!cookieHeader,
+    }
+});
+
 await crawler.run(startUrls);
-log.info('Crawl finished.', { 
+
+log.info('Crawl finished successfully! 🎉', { 
     totalPages: state.pagesScraped, 
     totalJobs: state.jobsScraped 
 });
