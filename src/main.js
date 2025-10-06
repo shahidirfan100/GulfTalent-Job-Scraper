@@ -6,7 +6,7 @@ const DEFAULT_SEARCH_URL = 'https://www.gulftalent.com/jobs/search';
 
 // Configuration
 const CRAWLER_CONFIG = {
-    maxConcurrency: 3, // Reduced to be more gentle
+    maxConcurrency: 3,
     maxRequestRetries: 3,
     requestHandlerTimeoutSecs: 120,
 };
@@ -186,54 +186,18 @@ function cleanDescription($) {
 }
 
 /**
- * Extracts page number from URL
+ * Constructs search URL with page parameter
+ * CRITICAL: The pagination works via the page parameter in the query string
  */
-function extractPageNumber(url) {
-    const pageMatch = url.match(/[?&]page=(\d+)/i);
-    if (pageMatch) {
-        return parseInt(pageMatch[1], 10);
-    }
-    
-    const pathMatch = url.match(/\/page\/(\d+)/i);
-    if (pathMatch) {
-        return parseInt(pathMatch[1], 10);
-    }
-    
-    // Check for mobile format: /mobile/search/jobs-in-_?page=2
-    const mobileMatch = url.match(/\/jobs-in-[^?]*\?page=(\d+)/i);
-    if (mobileMatch) {
-        return parseInt(mobileMatch[1], 10);
-    }
-    
-    return 1;
-}
-
-/**
- * Constructs the next page URL for mobile or desktop
- */
-function getNextPageUrl(currentUrl, currentPage) {
-    const nextPage = currentPage + 1;
-    
-    // Handle mobile URLs: /mobile/search/jobs-in-_?page=2
-    if (currentUrl.includes('/mobile/')) {
-        if (currentUrl.includes('?page=')) {
-            return currentUrl.replace(/\?page=\d+/, `?page=${nextPage}`);
-        } else if (currentUrl.includes('&page=')) {
-            return currentUrl.replace(/&page=\d+/, `&page=${nextPage}`);
-        } else {
-            // Add page parameter
-            return `${currentUrl}?page=${nextPage}`;
-        }
-    }
-    
-    // Handle desktop URLs
-    if (currentUrl.includes('page=')) {
-        return currentUrl.replace(/page=\d+/, `page=${nextPage}`);
-    } else if (currentUrl.includes('/page/')) {
-        return currentUrl.replace(/\/page\/\d+/, `/page/${nextPage}`);
-    } else {
-        const separator = currentUrl.includes('?') ? '&' : '?';
-        return `${currentUrl}${separator}page=${nextPage}`;
+function buildSearchUrl(baseSearchUrl, page) {
+    try {
+        const url = new URL(baseSearchUrl);
+        url.searchParams.set('page', page.toString());
+        return url.href;
+    } catch (e) {
+        // If URL parsing fails, try simple append
+        const separator = baseSearchUrl.includes('?') ? '&' : '?';
+        return `${baseSearchUrl}${separator}page=${page}`;
     }
 }
 
@@ -259,11 +223,11 @@ const crawler = new CheerioCrawler({
                 };
             }
             
-            // Use desktop user agent to try to get desktop version
+            // CRITICAL: Use desktop user agent and headers to avoid mobile redirect
             request.headers = {
                 ...request.headers,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
@@ -273,22 +237,19 @@ const crawler = new CheerioCrawler({
                 'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1',
                 'Cache-Control': 'max-age=0',
-                'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                'Sec-Ch-Ua-Mobile': '?0',
-                'Sec-Ch-Ua-Platform': '"Windows"',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
             };
         },
     ],
 
-    requestHandler: async ({ $, request, crawler }) => {
-        const { userData: { label } } = request;
+    requestHandler: async ({ $, request, crawler, body }) => {
+        const { userData: { label, baseSearchUrl, currentPage = 1 } } = request;
 
         if (label === 'LIST') {
-            const currentPage = extractPageNumber(request.url);
-            
-            log.info(`Scraping list page: ${request.url}`, {
-                page: currentPage,
-                pagesScraped: state.pagesScraped + 1,
+            log.info(`Processing page ${currentPage}: ${request.url}`, {
+                pagesScraped: state.pagesScraped,
                 jobsScraped: state.jobsScraped,
             });
             
@@ -299,163 +260,107 @@ const crawler = new CheerioCrawler({
 
             state.pagesScraped++;
 
-            // Detect if we're on mobile or desktop
-            const isMobilePage = request.url.includes('/mobile/');
+            // Check if we're on mobile version (this is the problem!)
+            const actualUrl = request.loadedUrl || request.url;
+            const isMobile = actualUrl.includes('/mobile/');
             
-            if (isMobilePage) {
-                log.info('Processing mobile page format');
-            } else {
-                log.info('Processing desktop page format');
+            if (isMobile) {
+                log.warning(`⚠️ REDIRECTED TO MOBILE VERSION: ${actualUrl}`);
+                log.info('This is why pagination fails - mobile version has different structure!');
             }
 
-            // Try to find the script with job data (desktop version)
+            // STRATEGY 1: Try to extract JSON data from script tag (desktop version)
             const scriptContent = $('script:contains("facetedSearchResultsValue")').html();
+            let jobs = [];
+            let totalResults = 0;
             
             if (scriptContent) {
-                log.info('Found JSON data in script tag (desktop format)');
+                log.info('✅ Found facetedSearchResultsValue JSON (desktop version)');
                 
                 const jsonStringMatch = scriptContent.match(/facetedSearchResultsValue['"]\s*,\s*({[\s\S]*?})\s*\)/);
                 if (jsonStringMatch && jsonStringMatch[1]) {
                     try {
                         const searchResults = JSON.parse(jsonStringMatch[1]);
-                        const jobs = searchResults.results?.data || [];
-                        const totalResults = searchResults.results?.total || 0;
-
-                        log.info(`Found ${jobs.length} jobs on this page`, {
-                            totalAvailable: totalResults,
-                            scraped: state.jobsScraped,
-                        });
-
-                        if (jobs.length === 0) {
-                            log.info('No more jobs found. End of results.');
-                            return;
-                        }
-
-                        for (const job of jobs) {
-                            if (maxJobs && state.jobsScraped >= maxJobs) {
-                                log.info(`Reached maxJobs limit: ${maxJobs}`);
-                                break;
-                            }
-
-                            const jobUrl = validateAndNormalizeUrl(job.link, BASE_URL);
-                            if (!jobUrl || state.seenUrls.has(jobUrl)) {
-                                if (state.seenUrls.has(jobUrl)) {
-                                    log.debug('Skipping duplicate job URL');
-                                }
-                                continue;
-                            }
-                            
-                            state.seenUrls.add(jobUrl);
-                            
-                            const jobData = {
-                                title: job.title || 'Not specified',
-                                company: job.company_name || 'Not specified',
-                                location: job.location || 'Not specified',
-                                date_posted: job.posted_date_ts 
-                                    ? new Date(job.posted_date_ts * 1000).toISOString() 
-                                    : 'Not specified',
-                                url: jobUrl,
-                            };
-
-                            if (collectDetails) {
-                                await crawler.addRequests([{ 
-                                    url: jobUrl,
-                                    userData: {
-                                        label: 'DETAIL',
-                                        jobData,
-                                    },
-                                }]);
-                            } else {
-                                await Dataset.pushData({
-                                    ...jobData,
-                                    description_html: null,
-                                    description_text: null,
-                                });
-                            }
-                            state.jobsScraped++;
-                        }
-
-                        // Check if we should continue
-                        const continueCrawling = (!maxJobs || state.jobsScraped < maxJobs) && 
-                                               (!maxPages || state.pagesScraped < maxPages);
+                        jobs = searchResults.results?.data || [];
+                        totalResults = searchResults.results?.total || 0;
                         
-                        if (continueCrawling && state.jobsScraped < totalResults) {
-                            const nextUrl = getNextPageUrl(request.url, currentPage);
-                            log.info(`Enqueuing next page: ${nextUrl}`, {
-                                progress: `${state.jobsScraped}/${totalResults}`,
-                            });
-                            await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
-                        } else {
-                            log.info('Pagination stopped.', {
-                                reason: !continueCrawling ? 'Limits reached' : 'All jobs scraped',
-                            });
-                        }
-
-                        return;
+                        log.info(`📊 JSON data parsed: ${jobs.length} jobs on this page, ${totalResults} total available`);
                     } catch (e) {
-                        log.error(`Failed to parse JSON data`, { 
-                            error: e.message, 
-                            stack: e.stack 
-                        });
+                        log.error(`Failed to parse JSON data`, { error: e.message });
                     }
                 }
             }
 
-            // --- FALLBACK: HTML SCRAPING (Mobile or Desktop without JSON) ---
-            log.info('Using HTML scraping fallback');
-            
-            try {
-                // Find job links - both mobile and desktop formats
-                let jobLinks;
+            // STRATEGY 2: Fallback to HTML scraping if no JSON found
+            if (jobs.length === 0) {
+                log.info('⚠️ No JSON found, using HTML scraping fallback...');
                 
-                if (isMobilePage) {
-                    // Mobile: links are direct in the page
-                    jobLinks = $('a[href^="/mobile/"]').filter((i, el) => {
+                // Try multiple selectors to find job links
+                const jobLinkSelectors = [
+                    'a[href*="/jobs/"][href*="-"]',  // Desktop format: /country/jobs/title-id
+                    'a[href^="/mobile/"][href*="/jobs/"]',  // Mobile format: /mobile/country/jobs/title-id
+                ];
+                
+                let $jobLinks = $();
+                for (const selector of jobLinkSelectors) {
+                    const $links = $(selector).filter((i, el) => {
                         const href = $(el).attr('href');
-                        return href && href.match(/\/mobile\/[^/]+\/jobs\/[^/]+-\d+$/);
+                        // Must be a job detail page (has job ID number at end)
+                        return href && 
+                               href.match(/\/jobs\/[^/]+-\d+$/) && 
+                               !href.includes('/search') &&
+                               !href.includes('/category');
                     });
-                } else {
-                    // Desktop: try to find job cards or links
-                    jobLinks = $('.search-result-item a, .job-item a, [data-job-id] a, a[href*="/jobs/"]').filter((i, el) => {
-                        const href = $(el).attr('href');
-                        return href && !href.includes('/search') && !href.includes('/category');
-                    });
-                }
-                
-                log.info(`Found ${jobLinks.length} job links via HTML scraping`);
-                
-                if (jobLinks.length === 0) {
-                    log.warning('No job links found on this page. Might be end of results or page structure changed.');
-                    log.info('Page title:', $('title').text());
-                    return;
-                }
-
-                const processedThisPage = new Set();
-                
-                for (let i = 0; i < jobLinks.length; i++) {
-                    if (maxJobs && state.jobsScraped >= maxJobs) {
-                        log.info(`Reached maxJobs limit: ${maxJobs}`);
+                    
+                    if ($links.length > 0) {
+                        $jobLinks = $links;
+                        log.info(`✅ Found ${$links.length} job links using selector: ${selector}`);
                         break;
                     }
+                }
+                
+                if ($jobLinks.length === 0) {
+                    log.error(`❌ NO JOB LINKS FOUND ON PAGE!`);
+                    log.info('Page title:', $('title').text());
+                    log.info('Page URL:', actualUrl);
+                    log.info('Body text preview:', $('body').text().substring(0, 200));
+                    
+                    // Check if we've hit the end
+                    if (state.jobsScraped > 0 && currentPage > 1) {
+                        log.info('Likely reached end of results.');
+                        return;
+                    }
+                    
+                    throw new Error('No jobs found on first page - likely blocked or site structure changed');
+                }
 
-                    const $link = $(jobLinks[i]);
+                // Extract job data from HTML
+                const processedThisPage = new Set();
+                
+                $jobLinks.each((i, el) => {
+                    const $link = $(el);
                     const href = $link.attr('href');
                     const fullUrl = validateAndNormalizeUrl(href, BASE_URL);
                     
                     if (!fullUrl || state.seenUrls.has(fullUrl) || processedThisPage.has(fullUrl)) {
-                        continue;
+                        return; // Skip
                     }
                     
-                    state.seenUrls.add(fullUrl);
                     processedThisPage.add(fullUrl);
                     
-                    // Extract basic info
+                    // Try to extract job info from surrounding context
                     const $container = $link.closest('div, li, article, tr');
                     let title = $link.text().trim();
                     
-                    // If link text is empty, try to find title nearby
+                    // If link text is empty or too short, look for title nearby
                     if (!title || title.length < 3) {
-                        title = $container.find('h2, h3, .job-title, [class*="title"]').first().text().trim();
+                        const $titleElem = $container.find('h2, h3, h4, .job-title, [class*="title"]').first();
+                        title = $titleElem.text().trim();
+                    }
+                    
+                    if (!title || title.length < 3) {
+                        log.debug('Skipping job with no valid title', { url: fullUrl });
+                        return;
                     }
                     
                     const company = $container.find('.company-name, [class*="company"]')
@@ -465,63 +370,96 @@ const crawler = new CheerioCrawler({
                     const date = $container.find('.date, time, [class*="date"]')
                         .first().text().trim() || 'Not specified';
                     
-                    if (!title || title === 'Not specified') {
-                        log.debug('Skipping job with no title', { url: fullUrl });
-                        continue;
-                    }
-                    
-                    const jobData = {
+                    jobs.push({
                         title,
-                        company,
+                        company_name: company,
                         location,
-                        date_posted: date,
-                        url: fullUrl,
-                    };
-                    
-                    if (collectDetails) {
-                        await crawler.addRequests([{ 
-                            url: fullUrl,
-                            userData: {
-                                label: 'DETAIL',
-                                jobData,
-                            },
-                        }]);
-                    } else {
-                        await Dataset.pushData({
-                            ...jobData,
-                            description_html: null,
-                            description_text: null,
-                        });
-                    }
-                    state.jobsScraped++;
+                        posted_date_ts: null,
+                        link: fullUrl,
+                        date_posted_text: date,
+                    });
+                });
+                
+                log.info(`📋 Extracted ${jobs.length} jobs from HTML`);
+            }
+
+            // PROCESS ALL JOBS
+            for (const job of jobs) {
+                if (maxJobs && state.jobsScraped >= maxJobs) {
+                    log.info(`✋ Reached maxJobs limit: ${maxJobs}`);
+                    return; // Stop processing completely
                 }
 
-                log.info(`Processed ${processedThisPage.size} jobs from this page`);
-
-                // Handle pagination
-                const continueCrawling = (!maxJobs || state.jobsScraped < maxJobs) && 
-                                       (!maxPages || state.pagesScraped < maxPages);
+                const jobUrl = validateAndNormalizeUrl(job.link, BASE_URL);
+                if (!jobUrl || state.seenUrls.has(jobUrl)) {
+                    continue;
+                }
                 
-                if (continueCrawling && processedThisPage.size > 0) {
-                    const nextUrl = getNextPageUrl(request.url, currentPage);
-                    log.info(`Enqueuing next page: ${nextUrl}`);
-                    await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
+                state.seenUrls.add(jobUrl);
+                
+                const jobData = {
+                    title: job.title || 'Not specified',
+                    company: job.company_name || 'Not specified',
+                    location: job.location || 'Not specified',
+                    date_posted: job.posted_date_ts 
+                        ? new Date(job.posted_date_ts * 1000).toISOString() 
+                        : (job.date_posted_text || 'Not specified'),
+                    url: jobUrl,
+                };
+
+                if (collectDetails) {
+                    await crawler.addRequests([{ 
+                        url: jobUrl,
+                        userData: {
+                            label: 'DETAIL',
+                            jobData,
+                        },
+                    }]);
                 } else {
-                    log.info('Pagination stopped.', {
-                        reason: processedThisPage.size === 0 ? 'No jobs found' : 'Limits reached',
-                        totalScraped: state.jobsScraped,
+                    await Dataset.pushData({
+                        ...jobData,
+                        description_html: null,
+                        description_text: null,
                     });
                 }
+                state.jobsScraped++;
+            }
 
-            } catch (e) {
-                log.error(`Failed during HTML scraping on ${request.url}`, { 
-                    error: e.message, 
-                    stack: e.stack 
-                });
+            log.info(`✅ Page ${currentPage} complete: ${jobs.length} jobs processed (Total: ${state.jobsScraped})`);
+
+            // PAGINATION LOGIC
+            const shouldContinue = (!maxJobs || state.jobsScraped < maxJobs) && 
+                                  (!maxPages || state.pagesScraped < maxPages);
+            
+            if (!shouldContinue) {
+                log.info(`🛑 Stopping: ${maxJobs ? 'maxJobs' : 'maxPages'} limit reached`);
+                return;
+            }
+
+            // If we got jobs, try next page
+            if (jobs.length > 0) {
+                const nextPage = currentPage + 1;
+                const nextPageUrl = buildSearchUrl(baseSearchUrl || request.url, nextPage);
+                
+                log.info(`➡️ Enqueueing page ${nextPage}: ${nextPageUrl}`);
+                
+                await crawler.addRequests([{ 
+                    url: nextPageUrl,
+                    userData: { 
+                        label: 'LIST',
+                        baseSearchUrl: baseSearchUrl || request.url,
+                        currentPage: nextPage,
+                    },
+                }]);
+            } else if (currentPage === 1) {
+                // No jobs on first page is an error
+                throw new Error('No jobs found on first page');
+            } else {
+                log.info(`🏁 No jobs on page ${currentPage}, assuming end of results`);
             }
 
         } else if (label === 'DETAIL') {
-            log.info(`Scraping detail page: ${request.url}`);
+            log.info(`Scraping job detail: ${request.url}`);
             
             try {
                 const jobType = extractMetadata($, 'Job Type');
@@ -536,7 +474,7 @@ const crawler = new CheerioCrawler({
                 const description = cleanDescription($);
                 
                 if (!description.text) {
-                    log.warning(`No description found for job: ${request.userData.jobData.title}`);
+                    log.warning(`No description found for: ${request.userData.jobData.title}`);
                 }
 
                 await Dataset.pushData({
@@ -570,19 +508,31 @@ const crawler = new CheerioCrawler({
     },
 
     failedRequestHandler: async ({ request }) => {
-        log.warning(`Request ${request.url} failed after ${CRAWLER_CONFIG.maxRequestRetries} retries`, {
+        log.warning(`❌ Request failed after ${CRAWLER_CONFIG.maxRequestRetries} retries: ${request.url}`, {
             errorMessages: request.errorMessages,
-            userData: request.userData,
         });
     },
 });
 
-// --- START URLS ---
+// --- BUILD START URLS ---
 const startUrls = [];
+let baseSearchUrl;
 
 if (inputStartUrl) {
-    startUrls.push({ url: inputStartUrl, userData: { label: 'LIST' } });
-} else if (keyword || location || posted_date) {
+    baseSearchUrl = inputStartUrl;
+    // Ensure page parameter is set to 1
+    const url = new URL(inputStartUrl);
+    url.searchParams.set('page', '1');
+    startUrls.push({ 
+        url: url.href,
+        userData: { 
+            label: 'LIST',
+            baseSearchUrl: inputStartUrl,
+            currentPage: 1,
+        } 
+    });
+} else {
+    // Build search URL from parameters or use default
     const constructedUrl = new URL('/jobs/search', BASE_URL);
     
     if (keyword) {
@@ -601,16 +551,22 @@ if (inputStartUrl) {
             constructedUrl.searchParams.set('filters[posted_date]', dateFilterMap[posted_date]);
         }
     }
-    constructedUrl.searchParams.set('page', '1');
     
-    startUrls.push({ url: constructedUrl.href, userData: { label: 'LIST' } });
-} else {
-    log.info('No search parameters provided. Fetching all available jobs from default URL.');
-    startUrls.push({ url: DEFAULT_SEARCH_URL, userData: { label: 'LIST' } });
+    constructedUrl.searchParams.set('page', '1');
+    baseSearchUrl = constructedUrl.href;
+    
+    startUrls.push({ 
+        url: constructedUrl.href,
+        userData: { 
+            label: 'LIST',
+            baseSearchUrl: constructedUrl.href,
+            currentPage: 1,
+        } 
+    });
 }
 
-log.info('Starting crawl...', { 
-    startUrls: startUrls.map(u => u.url),
+log.info('🚀 Starting GulfTalent Job Scraper', { 
+    startUrl: startUrls[0].url,
     config: {
         collectDetails,
         maxJobs: maxJobs || 'unlimited',
@@ -620,12 +576,17 @@ log.info('Starting crawl...', {
     }
 });
 
+log.info('📝 IMPORTANT: If the scraper gets stuck at 25 jobs, it means:');
+log.info('   1. Site is redirecting to mobile version (check logs for "REDIRECTED TO MOBILE")');
+log.info('   2. Pagination links are not being found');
+log.info('   3. Try using a different proxy or adding cookies');
+
 await crawler.run(startUrls);
 
 // Convert Set back to Array for storage
 state.seenUrls = Array.from(state.seenUrls);
 
-log.info('Crawl finished successfully! 🎉', { 
+log.info('✅ Scraping completed!', { 
     totalPages: state.pagesScraped, 
     totalJobs: state.jobsScraped 
 });
